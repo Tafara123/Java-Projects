@@ -1,0 +1,144 @@
+import csv
+import os
+import re
+import shutil
+import glob
+import base64
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tempfile
+from typing import Text, Optional
+from markdown_pdf import MarkdownPdf, Section
+
+
+def escape_invalid_chars(s):
+    return re.sub(r'[\x00-\x1F\x7F-\x9F]', lambda m: '\\u{:04x}'.format(ord(m.group(0))), s)
+
+
+def create_csv(name, column_names, result):
+    # Open csv file for writing
+    with open(f'./input/{name}.csv', mode='w', encoding='utf-8', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(column_names)
+        csv_writer.writerows(result)
+
+
+def read_first_lines_from_file(name):
+    file_path = "./input/" + name
+    with open(file_path, 'r') as file:
+        reader = csv.reader(file)
+        lines = [next(reader) for _ in range(2)]
+    return lines
+
+
+def delete_all_files_in_directory(directory_path):
+    if os.path.exists(directory_path):
+        for file_name in os.listdir(directory_path):
+            file_path = os.path.join(directory_path, file_name)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+
+
+def save_uploaded_file(uploaded_file, directory_path):
+    delete_all_files_in_directory(directory_path)
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+    file_path = os.path.join(directory_path, uploaded_file.name)
+    with open(file_path, 'wb') as f:
+        shutil.copyfileobj(uploaded_file, f)
+    return file_path
+
+
+def read_files(directory_path):
+    file_contents = {}
+    for file_path in glob.glob(os.path.join(directory_path, '*')):
+        with open(file_path, 'r') as file:
+            content = file.read()
+            file_name = os.path.basename(file_path)
+            file_contents[file_name] = content
+    return file_contents
+
+def read_file(file_path):
+    with open(file_path, 'r') as file:
+        content = file.read()
+    return content
+
+
+def find_file(file_name):
+    for root, dirs, files in os.walk('./input/BF4000M1/'):
+        if file_name in files:
+            return os.path.join(root, file_name)
+    return None
+
+def save_as_markdown(input_text, file_path):
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.write(input_text)
+
+
+# Function to convert image to base64 string
+def get_base64_of_bin_file(bin_file):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+
+def node_exists(node_id,st):
+    for node in st.session_state['nodes']:
+        if node.id == node_id:
+            return True
+    return False
+
+
+def file_splitter(file_path, chunk_size=10000, chunk_overlap=1000):
+    """
+    Split the contents of a file into overlapping chunks based on character count.
+
+    Args:
+        file_path (str): The path to the file to be split.
+        chunk_size (int): The maximum size (in characters) of each chunk.
+        chunk_overlap (int): The number of overlapping characters between consecutive chunks.
+
+    Returns:
+        list: A list of strings, where each string represents a chunk of text from the file.
+    """
+    # Read the file content
+    with open(file_path, "r") as file:
+        file_content = file.read()
+
+    # Split the file content into chunks with overlap
+    chunks = []
+    start = 0
+    end = chunk_size
+
+    while start < len(file_content):
+        chunk = file_content[start:end]
+        chunks.append(chunk)
+        start += chunk_size - chunk_overlap
+        end = start + chunk_size
+
+    return chunks
+
+
+def markdown_to_pdf(output_file: Text, markdown_content: Optional[Text] = None, file_path: Optional[Text] = None):
+    """
+    Converts Markdown content to a PDF document.
+
+    Args:
+        output_file (str): The path to the output PDF file.
+        markdown_content (str, optional): The Markdown content to be converted.
+        file_path (str, optional): The path to the Markdown file.
+    """
+
+    if markdown_content is None and file_path is None:
+        raise ValueError("Either markdown_content or file_path must be provided.")
+
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as temp_file:
+        if markdown_content is not None:
+            temp_file.write(markdown_content)
+        elif file_path is not None:
+            with open(file_path, 'r') as f:
+                markdown_content = f.read()
+
+        pdf = MarkdownPdf()
+        pdf.meta["title"] = 'Title'
+        pdf.add_section(Section(markdown_content, toc=False))
+        pdf.save(output_file)
