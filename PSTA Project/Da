@@ -1,15 +1,45 @@
 import streamlit as st
 import os
-import re
 from langchain.prompts import ChatPromptTemplate
-from streamlit_agraph import agraph, Node, Edge, Config
 import time
 import llm_service as llmService
-import utils
+import Current.utils as utils
 import db_service as dbService
-from datetime import datetime
+from pyvis.network import Network
+import math
 
-# Improved prompt templates for better documentation generation
+# Sprint 1
+# First: take prompt and scan for any file name like "Give me the dependancies for BF4000M1" folder should be scanned for BF4000M1.csv
+# Second: If file was found read first 2 lines and ask LLM first question with Colum prompt
+# Third: Take response and ask third question to build py script
+# Forth: save scrip and execute the script automatically
+
+# Sprint 2
+# Dependency graph
+# First take prompt and scan for any possible application name like "BF4000M1".
+# Second run query against possible names, on first response with data stop quering and save data as csv
+# Third run python script to present user with a image of dependancies including programs
+
+
+# Next steps 04/11/2024
+# Ask for graph
+# generate graph
+# for each job get a list of programs
+# document the list of programs, translate all commnets
+# Get chat history to work, currently all history is not being sent to the model
+
+
+# Code documentation
+# First take prompt and identify possible program file name.
+# Second search for the file names, stop on first one found
+# Third give the file as context to docuemnt
+# Forth provide the docuemnt to the user
+# Idea: use this prompt to get some insights of the graph:
+# Given the context form a neo4j database, the data describes the dependencies of and application, the jobs it uses and the programs the jobs call. What can you tell me about the data?
+#
+# context: {the response form the neo4j query}
+
+# Enhanced prompt templates for improved COBOL documentation
 BASE_PROMPT_TEMPLATE = """
 You are an expert technical documentation specialist tasked with creating comprehensive documentation for COBOL programs that will be read by non-technical stakeholders. Your documentation must be clear, precise, and accessible to readers with limited technical knowledge.
 
@@ -114,202 +144,343 @@ Analyze these chunk summaries carefully and produce the final document:
 {summaries}
 """
 
-# Initialize session state variables
-def initialize_session_state():
-    if 'nodes' not in st.session_state:
-        st.session_state['nodes'] = []
-    
-    if 'edges' not in st.session_state:
-        st.session_state['edges'] = []
-    
-    if 'chat_history' not in st.session_state:
-        st.session_state['chat_history'] = [{
-            "role": "system",
-            "content": "You are a documentation specialist, transforming COBOL code into clear, business-focused documentation."
-        }]
-    
-    if 'auth_token' not in st.session_state:
-        st.session_state['auth_token'] = ""
-    
-    if 'start_time' not in st.session_state:
-        st.session_state['start_time'] = time.time()
-    
-    if 'expires_in' not in st.session_state:
-        st.session_state['expires_in'] = 0
-    
-    if 'llm_service' not in st.session_state:
-        st.session_state['llm_service'] = llmService.LLMService()
-    
-    if 'db_service' not in st.session_state:
-        st.session_state['db_service'] = dbService.DBService()
-    
-    if 'chunk_summaries' not in st.session_state:
-        st.session_state['chunk_summaries'] = []
-    
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    
-    if 'chat_placeholder' not in st.session_state:
-        st.session_state.chat_placeholder = st.empty()
-    
-    if 'documentation_generated' not in st.session_state:
-        st.session_state.documentation_generated = False
-    
-    if 'current_program' not in st.session_state:
-        st.session_state.current_program = ""
-    
-    if 'progress_bar' not in st.session_state:
-        st.session_state.progress_bar = None
-    
-    if 'progress_status' not in st.session_state:
-        st.session_state.progress_status = None
+FILENAME_PROMPT_TEMPLATE = """
+Given the following question, use the question as context, do not answer the question, only use it as context. Break down the question to identify possible key words that could identify a possible file name. 
 
-def render_header():
-    """Render the application header with improved styling"""
-    image_path = 'cda.png'
+Only give the key words in a comma seperated list.
+
+Question to be used as context:
+
+"{context}"
+"""
+
+def process_program_documentation(program_name, file_path, progress_callback=None):
+    """
+    Generate comprehensive documentation for a COBOL program file.
     
-    if not os.path.isfile(image_path):
-        st.error(f"Image not found: {image_path}")
-    else:
-        bin_str = utils.get_base64_of_bin_file(image_path)
-        background_image = f"""
-        <style>    
-            [data-testid="stAppViewContainer"] > 
-            .main 
-            {{        background-image: url('data:image/png;base64,{bin_str}'); 
-                background-size: 100vw 100vh;  
-            }}
+    This function handles the complete documentation generation process:
+    1. Split the program file into logical chunks
+    2. Process each chunk with the LLM
+    3. Consolidate the chunk analyses into a final document
+    4. Generate output files in markdown and PDF formats
+    
+    Args:
+        program_name (str): Name of the COBOL program
+        file_path (str): Path to the COBOL source file
+        progress_callback (callable, optional): Function to call with progress updates
+        
+    Returns:
+        str: The generated documentation in markdown format
+    """
+    # Initialize output directories
+    os.makedirs("./output", exist_ok=True)
+    os.makedirs("./output/pdf", exist_ok=True)
+    
+    # Update progress if callback provided
+    if progress_callback:
+        progress_callback(0.2, f"Analyzing COBOL program: {program_name}")
+    
+    # Process program with intelligent chunking
+    chunk_summaries = []
+    chunks = utils.file_splitter(file_path)
+    total_chunks = len(chunks)
+    
+    # Process each chunk with the enhanced prompt
+    for i, chunk in enumerate(chunks):
+        # Update progress
+        if progress_callback:
+            progress = 0.2 + ((i / total_chunks) * 0.6)  # 20% to 80% of progress
+            progress_callback(progress, f"Processing chunk {i+1} of {total_chunks}")
+        
+        # Prepare prompt for analyzing this chunk
+        prompt_template = ChatPromptTemplate.from_template(BASE_PROMPT_TEMPLATE)
+        chunk_prompt = prompt_template.format(
+            context=chunk, 
+            program_name=program_name
+        )
+        
+        # Use a limited history context to avoid token limits
+        st.session_state['chat_history'].append({"role": "user", "content": chunk_prompt})
+        st.session_state['chat_history'] = st.session_state['chat_history'][-2:]
+        
+        # Submit to LLM for analysis
+        chunk_analysis = st.session_state['llm_service'].query_llm(
+            chunk_prompt,
+            st.session_state['auth_token'],
+            st.session_state['chat_history']
+        )
+        
+        # Store response in chat history
+        st.session_state['chat_history'].append({"role": "assistant", "content": chunk_analysis})
+        
+        # Clean up the response and save
+        cleaned_analysis = chunk_analysis.replace('```markdown', '').replace('```', '')
+        chunk_file_path = f'./output/chunk_summary{i+1}_documentation.md'
+        utils.save_as_markdown(cleaned_analysis, chunk_file_path)
+        chunk_summaries.append(cleaned_analysis)
+    
+    # Update progress
+    if progress_callback:
+        progress_callback(0.8, "Generating final documentation...")
+    
+    # Create the consolidated documentation with the enhanced summary prompt
+    if chunk_summaries:
+        summary_prompt = ChatPromptTemplate.from_template(SUMMARY_PROMPT_TEMPLATE)
+        all_summaries = '\n'.join(chunk_summaries)
+        final_prompt = summary_prompt.format(
+            summaries=all_summaries, 
+            program_name=program_name
+        )
+        
+        # Generate final documentation
+        final_document = st.session_state['llm_service'].query_llm(
+            final_prompt, 
+            st.session_state['auth_token'],
+            st.session_state['chat_history']
+        )
+        
+        # Clean up the final document
+        cleaned_document = final_document.replace('```markdown', '').replace('```', '')
+        
+        # Save outputs in multiple formats
+        md_path = f'./output/final_summary_{program_name}.md'
+        utils.save_as_markdown(cleaned_document, md_path)
+        
+        # Generate PDF with markdown_to_pdf
+        if progress_callback:
+            progress_callback(0.9, "Creating PDF documentation...")
             
-            .title {{
-                text-align: center;
-                padding: 10px;
-                color: white;
-                text-shadow: 2px 2px 4px #000000;
-                font-size: 2.5em;
-            }}
-            
-            .subtitle {{
-                text-align: center;
-                color: white;
-                margin-bottom: 30px;
-            }}
-            
-            /* Styling for chat messages */
-            .stChatMessage {{
-                background-color: rgba(255, 255, 255, 0.9);
-                border-radius: 10px;
-                margin-bottom: 10px;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            }}
-            
-            /* Styling for buttons */
-            .stButton > button {{
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                text-align: center;
-                text-decoration: none;
-                display: inline-block;
-                font-size: 16px;
-                margin: 4px 2px;
-                transition-duration: 0.4s;
-                cursor: pointer;
-                border-radius: 5px;
-                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-            }}
-            
-            .stButton > button:hover {{
-                background-color: #45a049;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
-            }}
-            
-            /* Custom styling for download button */
-            .download-btn {{
-                background-color: #2196F3;
-                color: white;
-                padding: 10px 15px;
-                border: none;
-                border-radius: 5px;
-                cursor: pointer;
-                font-size: 16px;
-                margin-top: 10px;
-                transition: background-color 0.3s;
-                display: block;
-                width: 100%;
-                text-align: center;
-            }}
-            
-            .download-btn:hover {{
-                background-color: #0b7dda;
-            }}
-        </style>    
-        """
-        st.markdown(background_image, unsafe_allow_html=True)
-        st.markdown("<div class='title'>COBOL Dependency Analyzer</div>", unsafe_allow_html=True)
-        st.markdown("<div class='subtitle'>Transforming Legacy Code into Business Knowledge</div>", unsafe_allow_html=True)
+        utils.markdown_to_pdf(
+            markdown_content=cleaned_document,
+            output_file=f"./output/pdf/{program_name}.pdf"
+        )
+        
+        # Complete
+        if progress_callback:
+            progress_callback(1.0, "Documentation completed successfully")
+        
+        return cleaned_document
+    
+    # Return empty string if no chunks were processed
+    return ""
+
+
+def count_node_types(nodes, edges):
+    counts = {
+        'application': 0,
+        'job': 0,
+        'program': 0,
+        'sub_program': 0
+    }
+
+    for node in nodes:
+        if node['group'] in counts:
+            counts[node['group']] += 1
+
+    print(f"Applications: {counts['application']}")
+    print(f"Jobs: {counts['job']}")
+    print(f"Programs: {counts['program']}")
+    print(f"Sub-programs: {counts['sub_program']}")
+    print(f"Total nodes: {sum(counts.values())}")
+
+    # programs = []
+    # jobs = []
+    # sub_programs = []
+    # for node in nodes:
+    #     print(f"Node: {node['label']} {node['group']} {node['id']}")
+    #     if node['group'] == 'job':
+    #         jobs.append(node['label'])
+    #     if node['group'] == 'program':
+    #         programs.append(node['label'])
+    #     if node['group'] == 'sub_program':
+    #         sub_programs.append(node['label'])
+    #
+    # print(f"Jobs: {jobs}")
+    # print(f"Programs: {programs}")
+    # print(f"Sub-programs: {sub_programs}")
+
 
 def render_graph(nodes, edges):
-    """
-    Original render_graph function to maintain dependency graph functionality
-    """
-    # Create a container for filters
+    # Create containers
     filter_container = st.container()
-
-    # Create a container for the graph
     graph_container = st.container()
 
+    # Add filters
     with filter_container:
-        cols = st.columns(3)
+        cols = st.columns(4)
         applications = cols[0].checkbox('Show Applications', value=True, key='app_filter')
         jobs = cols[1].checkbox('Show Jobs', value=True, key='job_filter')
         programs = cols[2].checkbox('Show Programs', value=True, key='prog_filter')
+        sub_programs = cols[3].checkbox('Show Sub-Programs', value=True, key='sub_prog_filter')
 
+    # Filter nodes based on checkbox selections
     filtered_nodes = [
         node for node in nodes
-        if (node.group == 'application' and applications) or
-           (node.group == 'job' and jobs) or
-           (node.group == 'program' and programs)
+        if (node["group"] == 'application' and applications) or
+           (node["group"] == 'job' and jobs) or
+           (node["group"] == 'program' and programs) or
+           (node["group"] == 'sub_program' and sub_programs)
     ]
 
-    visible_node_ids = {node.id for node in filtered_nodes}
+    # Filter edges to only include connections between visible nodes
+    visible_node_ids = {node["id"] for node in filtered_nodes}
     filtered_edges = [
         edge for edge in edges
-        if edge.source in visible_node_ids and edge.to in visible_node_ids
+        if edge["source"] in visible_node_ids and edge["target"] in visible_node_ids
     ]
 
-    config = Config(
-        height=1000,
-        width=1200,
-        nodeHighlightBehavior=True,
-        highlightColor="#F7A7A6",
+    # Create Pyvis network
+    net = Network(
+        height="750px",
+        width="100%",
+        bgcolor="#ffffff",
+        font_color="black",
         directed=True,
-        collapsible=True,
-        physics=False,
-        groups={
-            'application': {'color': 'grey', 'shape': 'dot', 'size': 30},
-            'program': {'color': 'aqua', 'shape': 'dot', 'size': 20},
-            'job': {'color': 'lime', 'shape': 'dot', 'size': 25}
-        },
-        layout={
-            'improvedLayout': True,
-            'clusterThreshold': 150,
-            'hierarchical': {
-                'enabled': True,
-                'levelSeparation': 250,
-                'nodeSpacing': 200,
-                'direction': 'LR',
-                'sortMethod': 'directed',
-                'shakeTowards': 'roots'
-            },
-            'zoom': 1,
-            'randomSeed': 42
-        }
+        notebook=False
     )
 
-    with graph_container:
-        agraph(nodes=filtered_nodes, edges=filtered_edges, config=config)
+    # Configure network options for radial layout
+    net.set_options("""
+    {
+        "layout": {
+            "improvedLayout": true,
+            "hierarchical": {
+                "enabled": false
+            }
+        },
+        "physics": {
+            "enabled": false
+        },
+        "edges": {
+            "color": {
+                "color": "#000000",
+                "hover": "#FF0000"
+            },
+            "font": {
+                "size": 12,
+                "align": "middle"
+            },
+            "smooth": {
+                "type": "curvedCW",
+                "roundness": 0.2
+            },
+            "arrows": {
+                "to": {
+                    "enabled": true,
+                    "scaleFactor": 0.5
+                }
+            }
+        },
+        "interaction": {
+            "dragNodes": false,
+            "dragView": true,
+            "zoomView": true,
+            "hover": true,
+            "navigationButtons": true
+        },
+        "nodes": {
+            "fixed": true,
+            "font": {
+                "size": 14
+            }
+        }
+    }""")
 
+    # Calculate positions for radial layout
+    app_nodes = [n for n in filtered_nodes if n["group"] == "application"]
+    job_nodes = [n for n in filtered_nodes if n["group"] == "job"]
+    prog_nodes = [n for n in filtered_nodes if n["group"] == "program"]
+    sub_prog_nodes = [n for n in filtered_nodes if n["group"] == "sub_program"]
+
+    # Center position
+    center_x, center_y = 0, 0
+
+    # Radius for each circle
+    job_radius = 300
+    prog_radius = 600
+    sub_prog_radius = 900
+
+    # Position application node in center
+    for i, node in enumerate(app_nodes):
+        net.add_node(
+            node["id"],
+            label=node["label"],
+            color='grey',
+            shape="dot",
+            size=40,
+            title=f"{node['group']}: {node['label']}",
+            x=center_x,
+            y=center_y,
+            physics=False
+        )
+
+    # Position job nodes in first circle
+    for i, node in enumerate(job_nodes):
+        angle = (2 * 3.14159 * i) / len(job_nodes) if len(job_nodes) > 0 else 0
+        x = center_x + job_radius * math.cos(angle)
+        y = center_y + job_radius * math.sin(angle)
+        net.add_node(
+            node["id"],
+            label=node["label"],
+            color='lime',
+            shape="dot",
+            size=30,
+            title=f"{node['group']}: {node['label']}",
+            x=x,
+            y=y,
+            physics=False
+        )
+
+    # Position program nodes in second circle
+    for i, node in enumerate(prog_nodes):
+        angle = (2 * 3.14159 * i) / len(prog_nodes) if len(prog_nodes) > 0 else 0
+        x = center_x + prog_radius * math.cos(angle)
+        y = center_y + prog_radius * math.sin(angle)
+        net.add_node(
+            node["id"],
+            label=node["label"],
+            color='aqua',
+            shape="dot",
+            size=20,
+            title=f"{node['group']}: {node['label']}",
+            x=x,
+            y=y,
+            physics=False
+        )
+
+    for i, node in enumerate(sub_prog_nodes):
+        angle = (2 * math.pi * i) / (len(sub_prog_nodes) or 1)
+        x = center_x + sub_prog_radius * math.cos(angle)
+        y = center_y + sub_prog_radius * math.sin(angle)
+        net.add_node(
+            node["id"],
+            label=node["label"],
+            color='#FFA500',  # orange color for sub-programs
+            shape="dot",
+            size=15,
+            title=f"{node['group']}: {node['label']}",
+            x=x,
+            y=y,
+            physics=False
+        )
+
+    # Add filtered edges with labels
+    for edge in filtered_edges:
+        net.add_edge(
+            edge["source"],
+            edge["target"],
+            title=edge.get("label", ""),
+            label=edge.get("label", ""),
+            arrows="to"
+        )
+
+    # Save and render
+    net_file = "graph.html"
+    net.save_graph(net_file)
+    with graph_container:
+        st.components.v1.html(open(net_file, "r", encoding="utf-8").read(), height=850)
+
+    # Custom styling for Streamlit
     st.markdown(
         """
         <style>
@@ -317,165 +488,398 @@ def render_graph(nodes, edges):
             background-color: white;
             padding: 5px;
             border-radius: 4px;
-        }        
+        }
         .appview-container {
-        max-width: 95% !important;
-        max-height: 95% !important;
+            max-width: 95% !important;
+            max-height: 90% !important;
         }
         .main > div {
-        max-width: 95% !important;
-        padding-left: 20px !important;
-        padding-right: 20px !important;
+            max-width: 95% !important;
+            padding-left: 20px !important;
+            padding-right: 20px !important;
         }
         </style>
         """,
         unsafe_allow_html=True
     )
 
-def extract_program_name_from_prompt(prompt):
-    """
-    Extract program name from user prompt if explicitly mentioned
-    Returns the program name or None if not found
-    """
-    # Pattern to match common ways users might specify a program name
-    patterns = [
-        r"for\s+program\s+([A-Za-z0-9_\-\.]+)",  # "for program XYZ123"
-        r"for\s+([A-Za-z0-9_\-\.]+)(?:\s|$|\.)",  # "for XYZ123" or "for XYZ123."
-        r"documentation\s+for\s+([A-Za-z0-9_\-\.]+)",  # "documentation for XYZ123"
-        r"document\s+([A-Za-z0-9_\-\.]+)",  # "document XYZ123"
-        r"analyze\s+([A-Za-z0-9_\-\.]+)",  # "analyze XYZ123"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, prompt, re.IGNORECASE)
-        if match:
-            return match.group(1).strip().upper()
-    
-    return None
 
-def generate_documentation(prompt):
+def add_sub_program_nodes(nodes, edges):
     """
-    Enhanced documentation generation function with direct program name extraction
+    Identifies sub-programs based on call hierarchy:
+    - Programs are called by applications or jobs only
+    - Sub-programs are called by programs or other sub-programs
     """
-    # Clear output folder
-    utils.delete_all_files_in_directory("./src/output/")
-    
-    # Initialize progress tracking
-    st.session_state.progress_bar = st.progress(0)
-    st.session_state.progress_status = st.empty()
-    
-    st.session_state.progress_status.info("🔍 Analyzing your request...")
-    
-    # Try to extract program name directly from the prompt
-    program_name = extract_program_name_from_prompt(prompt)
-    
-    if program_name:
-        st.session_state.current_program = program_name
-        st.session_state.progress_bar.progress(15)
-        st.session_state.progress_status.info(f"🔍 Searching for program file: {program_name}...")
-    else:
-        st.session_state.progress_status.error("❌ Could not identify a program name in your request. Please specify the program name more clearly.")
-        st.session_state.progress_bar.progress(100)
-        return "I couldn't identify a specific program name in your request. Please try again with a clearer program name, for example: 'Generate documentation for PAYROLL01'"
-    
-    # Search for main program file
-    search = utils.find_file(program_name)
-    if search:
-        found = True
-        found_file = search
-    else:
-        # Try with PGM extension
-        search = utils.find_file(program_name + ".PGM")
-        if search:
-            found = True
-            found_file = search
-        else:
-            st.session_state.progress_status.error(f"❌ Program file '{program_name}' not found. Please check the program name.")
-            st.session_state.progress_bar.progress(100)
-            return f"Sorry, I couldn't find the program file '{program_name}'. Please check the program name and try again."
-    
-    st.session_state.progress_bar.progress(25)
-    st.session_state.progress_status.info(f"📋 Found program file: {st.session_state.current_program}. Beginning analysis...")
-    
-    # Process program with intelligent chunking
-    all_chunk_summaries = []
-    chunks = utils.intelligent_file_splitter(found_file)
-    total_chunks = len(chunks)
-    
-    for i, chunk in enumerate(chunks):
-        progress = 25 + int((i / total_chunks) * 50)  # 25% to 75% of progress bar
-        st.session_state.progress_bar.progress(progress)
-        st.session_state.progress_status.info(f"🔍 Analyzing chunk {i+1} of {total_chunks}...")
+    # Track programs that should be reclassified as sub-programs
+    sub_programs = set()
+    programs = {node["id"] for node in nodes if node["group"] == "program"}
+
+    # First pass: identify programs called by other programs
+    for edge in edges:
+        source_node = next((node for node in nodes if node["id"] == edge["source"]), None)
+        target_id = edge["target"]
+
+        if (source_node and
+                source_node["group"] in ["program", "sub_program"] and
+                target_id in programs):
+            sub_programs.add(target_id)
+
+    # Second pass: check that remaining programs are only called by applications or jobs
+    for node in nodes:
+        if node["group"] == "program":
+            # Get all incoming edges to this node
+            incoming_edges = [edge for edge in edges if edge["target"] == node["id"]]
+
+            for edge in incoming_edges:
+                source_node = next((n for n in nodes if n["id"] == edge["source"]), None)
+                if source_node and source_node["group"] not in ["application", "job"]:
+                    sub_programs.add(node["id"])
+                    break
+
+    # Update the group type for identified sub-programs
+    for node in nodes:
+        if node["id"] in sub_programs:
+            node["group"] = "sub_program"
+
+    return nodes
+
+
+def reclassify_self_calling_subprograms(nodes, edges):
+    """
+    Identifies sub-programs that call themselves and reclassifies them as programs.
+    """
+    # Find sub-programs with self-calls
+    self_calling = set()
+
+    for edge in edges:
+        if edge['source'] == edge['target']:  # self-call detected
+            source_node = next((node for node in nodes if node['id'] == edge['source'] and
+                                node['group'] == 'sub_program'), None)
+            if source_node:
+                self_calling.add(source_node['id'])
+
+    # Reclassify self-calling sub-programs as programs
+    for node in nodes:
+        if node['id'] in self_calling:
+            node['group'] = 'program'
+
+    return nodes
+
+
+if 'nodes' not in st.session_state:
+    st.session_state['nodes'] = []
+
+if 'edges' not in st.session_state:
+    st.session_state['edges'] = []
+
+if 'chat_history' not in st.session_state:
+    st.session_state['chat_history'] = [{
+        "role": "system",
+        "content": "You are a software developer, helping humans with their code related questions."
+    }]
+
+if 'auth_token' not in st.session_state:
+    st.session_state['auth_token'] = ""
+
+if 'start_time' not in st.session_state:
+    st.session_state['start_time'] = time.time()
+
+if 'expires_in' not in st.session_state:
+    st.session_state['expires_in'] = 0
+
+if 'llm_service' not in st.session_state:
+    st.session_state['llm_service'] = llmService.LLMService()
+
+if 'db_service' not in st.session_state:
+    st.session_state['db_service'] = dbService.DBService()
+
+if 'chunk_summaries' not in st.session_state:
+    st.session_state['chunk_summaries'] = []
+
+dependency_types = ["Job dependencies", "Create documentation"]
+image_path = 'cda.png'
+
+if not os.path.isfile(image_path):
+    st.error(f"Image not found: {image_path}")
+else:
+    bin_str = utils.get_base64_of_bin_file(image_path)
+    background_image = f"""
+    <style>    
+        [data-testid="stAppViewContainer"] > 
+        .main 
+        {{        background-image: url('data:image/png;base64,{bin_str}'); 
+            background-size: 100vw 100vh;  
         
-        content = chunk
-        prompt_template = ChatPromptTemplate.from_template(BASE_PROMPT_TEMPLATE)
-        new_prompt = prompt_template.format(
-            context=content, 
-            program_name=st.session_state.current_program
-        )
+            /* This sets the size to cover 100% of the viewport width and height */
+           
+        }}    
+    </style>    
+    """
+    st.markdown("<h1 style='color:white;'>COBOL Dependency Analyzer</h1>", unsafe_allow_html=True)
+    st.markdown(background_image, unsafe_allow_html=True)
+
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        st.chat_message(message['role']).markdown(message['content'])
+
+    prompt = st.chat_input('Pass Your Prompt here')
+
+    st.markdown(
+        """
+        <style>
+        .stSelectbox label {
+            color: white;
+            
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    selected_dependency = st.selectbox("Select type", dependency_types)
+
+    st.markdown(
+        """
+        <style>
+        .stFileUploader label {
+            color: white;
+            
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    # uploaded_file = st.file_uploader("Choose a file")
+
+    # if uploaded_file is not None:
+    #     save_uploaded_file(uploaded_file, './input')
+    #     st.success(f"File {uploaded_file.name} saved successfully!")
+
+    if st.session_state['nodes']:
+        render_graph(st.session_state['nodes'], st.session_state['edges'])
+
+if prompt:
+    llm_response = ""
+    llm_chat_response = ""
+    fileName = ""  # name of the file
+
+    if selected_dependency == "Create documentation":
+        st.chat_message('user').markdown(prompt)
+        st.session_state.messages.append({'role': 'user', 'content': prompt})
+
+        # Clear output folder
+        utils.delete_all_files_in_directory("./src/output/")
+
+        # Show progress indicator
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
+        # Progress callback function
+        def update_progress(progress_value, status_message):
+            progress_bar.progress(progress_value)
+            status_text.info(status_message)
+        
+        # Step 1: Extract program name from prompt
+        update_progress(0.1, "🔍 Analyzing request...")
+        prompt_template = ChatPromptTemplate.from_template(FILENAME_PROMPT_TEMPLATE)
+        new_prompt = prompt_template.format(context=prompt)
         st.session_state['chat_history'].append({"role": "user", "content": new_prompt})
-        st.session_state['chat_history'] = st.session_state['chat_history'][-15:]
+        st.session_state['chat_history'] = st.session_state['chat_history'][-2:]
         
         llm_response = st.session_state['llm_service'].query_llm(
             new_prompt, 
             st.session_state['auth_token'],
             st.session_state['chat_history']
         )
-        
         st.session_state['chat_history'].append({"role": "assistant", "content": llm_response})
-        document = llm_response.replace('```markdown', '').replace('```', '')
+        program_names = llm_response.split(",")
         
-        # Store chunk summary
-        file_path = f'./output/chunk_summary{i+1}_documentation.md'
-        utils.save_as_markdown(document, file_path)
-        all_chunk_summaries.append(document)
-    
-    st.session_state.progress_bar.progress(75)
-    st.session_state.progress_status.info("🔄 Consolidating analysis into final documentation...")
-    
-    # Generate consolidated summary
-    summary_prompt = ChatPromptTemplate.from_template(SUMMARY_PROMPT_TEMPLATE)
-    summaries = '\n'.join(all_chunk_summaries)
-    final_prompt = summary_prompt.format(
-        summaries=summaries, 
-        program_name=st.session_state.current_program
+        # Step 2: Find program file
+        found = False
+        found_file = None
+        fileName = ""
+        
+        for name in program_names:
+            name = name.strip().upper()
+            fileName = name
+            
+            # Search for program file with various extensions
+            update_progress(0.15, f"🔍 Searching for program file: {name}")
+            search = utils.find_file(name)
+            if search:
+                found = True
+                found_file = search
+            else:
+                search = utils.find_file(name + ".PGM")
+                if search:
+                    found = True
+                    found_file = search
+                    
+            if found:
+                break
+        
+        # Step 3: Generate documentation if file found
+        if found:
+            # Process the file and generate documentation
+            llm_chat_response = process_program_documentation(
+                program_name=fileName,
+                file_path=found_file,
+                progress_callback=update_progress
+            )
+        else:
+            # File not found
+            update_progress(1.0, "❌ Program file not found. Please check the program name.")
+            llm_chat_response = "Sorry, I couldn't find the program file you requested. Please check the program name and try again."
+
+    elif selected_dependency == "Job dependencies":
+        st.chat_message('user').markdown(prompt)
+        st.session_state.messages.append({'role': 'user', 'content': prompt})
+
+        # Get file name
+        prompt_template = ChatPromptTemplate.from_template(FILENAME_PROMPT_TEMPLATE)
+        new_prompt = prompt_template.format(context=prompt)
+        st.session_state['chat_history'].append({"role": "user", "content": new_prompt})
+        llm_response = st.session_state['llm_service'].query_llm(new_prompt, st.session_state['auth_token'],
+                                                                 st.session_state['chat_history'])
+        st.session_state['chat_history'].append({"role": "assistant", "content": llm_response})
+
+        file_names = llm_response.split(",")
+
+        # Search for the csv of the potential file names
+        found = False
+        found_file = ""
+        file_lines = ""
+        fname = ''
+        fileName = ''
+
+        for name in file_names:
+            fname = name.upper().strip()
+            if fname != "DEPENDENCIES":
+                if st.session_state['db_service'].find_and_populate_from_xinfo_data(name, selected_dependency):
+                    found = True
+                    found_file = name.strip() + ".csv"
+                    fileName = fname
+
+        if found and fileName != '':
+            def get_graph_data():
+                # Query results from Neptune database
+                results = st.session_state['db_service'].execute_ne04j_query(fileName)
+
+                # Track unique nodes and mapping
+                node_map = {}  # {(type, name): node_id}
+                id_map = {}  # {old_id: new_id}
+                next_id = 0
+
+                st.session_state['nodes'] = []
+                st.session_state['edges'] = []
+                relationships = []
+
+                # First pass: collect nodes and relationships
+                for result in results['results']:
+                    relationships.extend(result['relationships'])
+
+                    for node in result['nodes']:
+                        old_id = node['~id']
+                        properties = node['~properties']
+
+                        if old_id in id_map:
+                            continue
+
+                        # Determine node type and name
+                        if 'program' in node['~labels']:
+                            node_type = 'program'
+                            name = properties.get('program_name', '')
+                        elif 'application' in node['~labels']:
+                            node_type = 'application'
+                            name = properties.get('application_name', '')
+                        elif 'job' in node['~labels']:
+                            node_type = 'job'
+                            name = properties.get('job_name', '')
+                        else:
+                            continue
+
+                        unique_key = (node_type, name)
+
+                        # Create new node if unique
+                        if unique_key not in node_map:
+                            new_id = str(next_id)
+                            next_id += 1
+                            node_map[unique_key] = new_id
+                            id_map[old_id] = new_id
+
+                            new_node = {
+                                'id': new_id,
+                                'label': name,
+                                'group': node_type
+                            }
+                            st.session_state['nodes'].append(new_node)
+                        else:
+                            id_map[old_id] = node_map[unique_key]
+
+                # Second pass: create edges
+                seen_edges = set()
+                for relationship in relationships:
+                    source_id = relationship['~start']
+                    target_id = relationship['~end']
+
+                    if source_id not in id_map or target_id not in id_map:
+                        continue
+
+                    new_source = id_map[source_id]
+                    new_target = id_map[target_id]
+                    edge_key = (new_source, new_target, relationship['~type'])
+
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        st.session_state['edges'].append({
+                            'source': new_source,
+                            'target': new_target,
+                            'label': relationship['~type']
+                        })
+
+                return st.session_state['nodes'], st.session_state['edges']
+
+            nodes, edges = get_graph_data()
+            if st.session_state['nodes']:
+                nodes = add_sub_program_nodes(nodes, edges)
+                nodes = reclassify_self_calling_subprograms(nodes, edges)
+                render_graph(nodes, edges)
+                # count_node_types(nodes, edges)
+
+    st.markdown(
+        """
+            <style>
+            .stChatMessage {
+                background-color: white;
+            }
+            </style>
+            """,
+        unsafe_allow_html=True
     )
-    
-    final_summary = st.session_state['llm_service'].query_llm(
-        final_prompt, 
-        st.session_state['auth_token'],
-        st.session_state['chat_history']
-    )
-    
-    cleaned_summary = final_summary.replace('```markdown', '').replace('```', '')
-    
-    st.session_state.progress_bar.progress(90)
-    st.session_state.progress_status.info("📝 Generating final documentation files...")
-    
-    # Save the final documentation
-    utils.save_as_markdown(cleaned_summary, f'./output/final_summary_{st.session_state.current_program}.md')
-    
-    # Generate PDF with enhanced formatting and structure
-    timestamp = datetime.now().strftime("%Y-%m-%d")
-    metadata = {
-        "title": f"Technical Documentation: {st.session_state.current_program}",
-        "author": "COBOL Dependency Analyzer",
-        "date": timestamp,
-        "subject": "Program Documentation"
-    }
-    
-    pdf_path = f"./output/pdf/{st.session_state.current_program}.pdf"
-    utils.enhanced_markdown_to_pdf(
-        markdown_content=cleaned_summary, 
-        output_file=pdf_path,
-        metadata=metadata
-    )
-    
-    st.session_state.progress_bar.progress(100)
-    st.session_state.progress_status.success("✅ Documentation successfully generated!")
-    
-    # Set session state to indicate documentation has been generated
-    st.session_state.documentation_generated = True
-    
-    return cleaned_summary
+    st.chat_message('assistant').markdown(llm_chat_response)
+    st.session_state.messages.append({'role': 'assistant', 'content': llm_chat_response})
+
+   if selected_dependency == "Create documentation" and found and fileName != '':
+        try:
+            with open(f"./output/pdf/{fileName}.pdf", "rb") as file:
+                btn = st.download_button(
+                    label="Download PDF",
+                    data=file,
+                    file_name=f"{fileName}.pdf",
+                    mime="application/pdf",
+                )
+        except FileNotFoundError:
+            st.warning(f"PDF file for {fileName} could not be found. The markdown version is still available.")
+
+        # Also provide markdown download option
+        md_path = f'./output/final_summary_{fileName}.md'
+        if os.path.exists(md_path):
+            with open(md_path, "r", encoding="utf-8") as file:
+                st.download_button(
+                    label="Download Markdown",
+                    data=file.read(),
+                    file_name=f"{fileName}_documentation.md",
+                    mime="text/markdown",
+                    key="md_download"
+                )
